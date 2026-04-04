@@ -7,11 +7,13 @@ const cuckoo = @import("cuckoo_simd_map.zig");
 
 const Io = std.Io;
 const StdMap = std.AutoHashMap(u64, u64);
+const ArrayHashMapImpl = std.AutoArrayHashMap(u64, u64);
 const QfMap = qf.QfHashMap(u64, u64);
 const QfMetaTreeRunEndMap = qf_meta_tree_runend.QfMetaTreeRunEndHashMap(u64, u64);
 const CuckooMap = cuckoo.CuckooSimdHashMap(u64, u64);
 const BoostMap = boost.BoostStyleFlatMap(u64, u64);
 const StdBench = BenchmarkFns(StdMap);
+const ArrayHashMapBench = BenchmarkFns(ArrayHashMapImpl);
 const QfBench = BenchmarkFns(QfMap);
 const QfMetaTreeRunEndBench = BenchmarkFns(QfMetaTreeRunEndMap);
 const CuckooBench = BenchmarkFns(CuckooMap);
@@ -31,6 +33,7 @@ const BenchmarkRun = struct {
 
 const bench_specs = [_]BenchSpec{
     .{ .short_label = "std", .size_label = "std.AutoHashMap(u64,u64):", .Map = StdMap, .Bench = StdBench },
+    .{ .short_label = "arrayhashmap", .size_label = "std.ArrayHashMap(u64,u64):", .Map = ArrayHashMapImpl, .Bench = ArrayHashMapBench },
     .{ .short_label = "qf", .size_label = "QfHashMap(u64,u64):", .Map = QfMap, .Bench = QfBench },
     .{ .short_label = "qf_meta_tree_runend", .size_label = "QfMetaTreeRunEndHashMap(u64,u64):", .Map = QfMetaTreeRunEndMap, .Bench = QfMetaTreeRunEndBench },
     .{ .short_label = "cuckoo", .size_label = "CuckooSimdHashMap(u64,u64):", .Map = CuckooMap, .Bench = CuckooBench },
@@ -78,7 +81,22 @@ fn BenchmarkFns(comptime MapType: type) type {
                 return map;
             }
 
+            if (MapType == ArrayHashMapImpl) {
+                var map = MapType.init(allocator);
+                if (reserve_for_std) {
+                    try map.ensureTotalCapacity(@intCast(capacity));
+                }
+                return map;
+            }
+
             return try MapType.initCapacity(allocator, capacity);
+        }
+
+        fn removeKey(map: *MapType, key: u64) bool {
+            if (MapType == ArrayHashMapImpl) {
+                return map.swapRemove(key);
+            }
+            return map.remove(key);
         }
 
         fn deleteChurn(io: Io, allocator: std.mem.Allocator, cfg: Config) !Result {
@@ -107,7 +125,7 @@ fn BenchmarkFns(comptime MapType: type) type {
                     std.debug.print("map type: {s}\n", .{@typeName(MapType)});
                     return error.BenchmarkInvariantFailed;
                 }
-                if (!map.remove(old_key)) return error.BenchmarkInvariantFailed;
+                if (!removeKey(&map, old_key)) return error.BenchmarkInvariantFailed;
 
                 const new_key = next_key;
                 next_key += 1;
@@ -142,7 +160,7 @@ fn BenchmarkFns(comptime MapType: type) type {
             for (0..cfg.operations) |i| {
                 const key = @as(u64, @intCast(i % cfg.working_set));
 
-                if (!map.remove(key)) return error.BenchmarkInvariantFailed;
+                if (!removeKey(&map, key)) return error.BenchmarkInvariantFailed;
                 try map.put(key, key +% @as(u64, @intCast(i)));
 
                 checksum +%= map.get(key).?;
@@ -179,7 +197,7 @@ fn BenchmarkFns(comptime MapType: type) type {
                 if ((i & 255) == 255 and head < tail) {
                     const victim = queue[head];
                     head += 1;
-                    if (!map.remove(victim)) return error.BenchmarkInvariantFailed;
+                    if (!removeKey(&map, victim)) return error.BenchmarkInvariantFailed;
                     deletes += 1;
                 }
 
@@ -226,7 +244,7 @@ fn BenchmarkFns(comptime MapType: type) type {
                 if ((i & 127) == 127 and head < tail) {
                     const victim = queue[head];
                     head += 1;
-                    if (!map.remove(victim)) return error.BenchmarkInvariantFailed;
+                    if (!removeKey(&map, victim)) return error.BenchmarkInvariantFailed;
                     deletes += 1;
                 }
 
