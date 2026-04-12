@@ -6,7 +6,6 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
     const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
 
     return struct {
-        allocator: std.mem.Allocator,
         ctx: Context,
         metadata: ?[*]u8,
         cap: usize,
@@ -23,24 +22,22 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
         const group_span = 16;
         const empty_meta: u8 = 0;
 
-        pub fn initCapacity(allocator: std.mem.Allocator, expected_items: usize) !Self {
-            var self = Self{
-                .allocator = allocator,
-                .ctx = .{},
-                .metadata = null,
-                .cap = 0,
-                .group_count = 0,
-                .len = 0,
-                .max_load = 0,
-            };
-            try self.ensureCapacity(expected_items);
-            return self;
+        pub const empty: Self = .{
+            .ctx = .{},
+            .metadata = null,
+            .cap = 0,
+            .group_count = 0,
+            .len = 0,
+            .max_load = 0,
+        };
+
+        pub fn ensureTotalCapacity(self: *Self, allocator: std.mem.Allocator, expected_items: usize) !void {
+            try self.ensureCapacity(allocator, expected_items);
         }
 
-        pub fn deinit(self: *Self) void {
-            self.deallocateStorage();
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.deallocateStorage(allocator);
             self.* = .{
-                .allocator = self.allocator,
                 .ctx = self.ctx,
                 .metadata = null,
                 .cap = 0,
@@ -59,8 +56,8 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             return self.values()[idx];
         }
 
-        pub fn put(self: *Self, key: K, value: V) !void {
-            try self.ensureCapacity(self.len + 1);
+        pub fn put(self: *Self, allocator: std.mem.Allocator, key: K, value: V) !void {
+            try self.ensureCapacity(allocator, self.len + 1);
             self.putAssumeCapacity(key, value);
         }
 
@@ -78,7 +75,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             return true;
         }
 
-        fn ensureCapacity(self: *Self, min_items: usize) !void {
+        fn ensureCapacity(self: *Self, allocator: std.mem.Allocator, min_items: usize) !void {
             if (self.cap > 0 and min_items <= self.max_load) return;
 
             const target = if (self.cap > 0 and min_items <= maxLoad(self.cap))
@@ -88,7 +85,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
 
             var new_groups: usize = if (self.group_count == 0) 8 else self.group_count;
             while (target > maxLoad(new_groups * group_size)) new_groups *= 2;
-            try self.growToGroups(new_groups);
+            try self.growToGroups(allocator, new_groups);
         }
 
         inline fn maxLoad(cap: usize) usize {
@@ -111,7 +108,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             return self.metadata.?;
         }
 
-        fn allocateStorage(self: *Self, new_group_count: usize) !void {
+        fn allocateStorage(self: *Self, allocator: std.mem.Allocator, new_group_count: usize) !void {
             const header_align = @alignOf(Header);
             const key_align = if (@sizeOf(K) == 0) 1 else @alignOf(K);
             const val_align = if (@sizeOf(V) == 0) 1 else @alignOf(V);
@@ -125,7 +122,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             const vals_end = vals_start + new_cap * @sizeOf(V);
             const total_size = max_align.forward(vals_end);
 
-            const slice = try self.allocator.alignedAlloc(u8, max_align, total_size);
+            const slice = try allocator.alignedAlloc(u8, max_align, total_size);
             const ptr: [*]u8 = @ptrCast(slice.ptr);
             const hdr: *Header = @ptrCast(@alignCast(ptr));
             if (@sizeOf([*]K) != 0) hdr.keys = @ptrCast(@alignCast(ptr + keys_start));
@@ -138,7 +135,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             @memset(self.metaPtr()[0 .. new_group_count * group_span], empty_meta);
         }
 
-        fn deallocateStorage(self: *Self) void {
+        fn deallocateStorage(self: *Self, allocator: std.mem.Allocator) void {
             if (self.metadata == null) return;
 
             const header_align = @alignOf(Header);
@@ -154,15 +151,14 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
             const total_size = std.mem.alignForward(usize, vals_end, max_align);
 
             const slice = @as([*]align(max_align) u8, @ptrCast(@alignCast(self.header())))[0..total_size];
-            self.allocator.free(slice);
+            allocator.free(slice);
             self.metadata = null;
             self.cap = 0;
             self.group_count = 0;
         }
 
-        fn growToGroups(self: *Self, new_group_count: usize) !void {
+        fn growToGroups(self: *Self, allocator: std.mem.Allocator, new_group_count: usize) !void {
             var new_map = Self{
-                .allocator = self.allocator,
                 .ctx = self.ctx,
                 .metadata = null,
                 .cap = 0,
@@ -170,8 +166,8 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
                 .len = 0,
                 .max_load = 0,
             };
-            try new_map.allocateStorage(new_group_count);
-            errdefer new_map.deallocateStorage();
+            try new_map.allocateStorage(allocator, new_group_count);
+            errdefer new_map.deallocateStorage(allocator);
 
             if (self.cap > 0) {
                 for (0..self.cap) |bucket| {
@@ -179,7 +175,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
                         new_map.putAssumeCapacity(self.keys()[bucket], self.values()[bucket]);
                     }
                 }
-                self.deallocateStorage();
+                self.deallocateStorage(allocator);
             }
 
             self.* = new_map;

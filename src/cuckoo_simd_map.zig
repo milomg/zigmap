@@ -6,7 +6,6 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
     const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
 
     return struct {
-        allocator: std.mem.Allocator,
         ctx: Context,
         keys: []K,
         values: []V,
@@ -20,27 +19,25 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
         const max_load_den = 8;
         const max_kicks = 64;
 
-        pub fn initCapacity(allocator: std.mem.Allocator, expected_items: usize) !Self {
-            var self = Self{
-                .allocator = allocator,
-                .ctx = .{},
-                .keys = &.{},
-                .values = &.{},
-                .tags = &.{},
-                .bucket_count = 0,
-                .len = 0,
-            };
-            try self.ensureCapacity(expected_items);
-            return self;
+        pub const empty: Self = .{
+            .ctx = .{},
+            .keys = &.{},
+            .values = &.{},
+            .tags = &.{},
+            .bucket_count = 0,
+            .len = 0,
+        };
+
+        pub fn ensureTotalCapacity(self: *Self, allocator: std.mem.Allocator, expected_items: usize) !void {
+            try self.ensureCapacity(allocator, expected_items);
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.bucket_count == 0) return;
-            self.allocator.free(self.keys);
-            self.allocator.free(self.values);
-            self.allocator.free(self.tags);
+            allocator.free(self.keys);
+            allocator.free(self.values);
+            allocator.free(self.tags);
             self.* = .{
-                .allocator = self.allocator,
                 .ctx = self.ctx,
                 .keys = &.{},
                 .values = &.{},
@@ -59,9 +56,9 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             return self.values[idx];
         }
 
-        pub fn put(self: *Self, key: K, value: V) !void {
-            try self.ensureCapacity(self.len + 1);
-            self.putAssumeCapacity(key, value);
+        pub fn put(self: *Self, allocator: std.mem.Allocator, key: K, value: V) !void {
+            try self.ensureCapacity(allocator, self.len + 1);
+            self.tryPut(allocator, key, value);
         }
 
         pub fn remove(self: *Self, key: K) bool {
@@ -71,44 +68,43 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             return true;
         }
 
-        fn ensureCapacity(self: *Self, min_items: usize) !void {
+        fn ensureCapacity(self: *Self, allocator: std.mem.Allocator, min_items: usize) !void {
             if (self.bucket_count > 0 and min_items <= maxLoad(self.bucket_count)) return;
 
             var new_bucket_count: usize = if (self.bucket_count == 0) 64 else self.bucket_count;
             while (min_items > maxLoad(new_bucket_count)) new_bucket_count *= 2;
-            try self.growTo(new_bucket_count);
+            try self.growTo(allocator, new_bucket_count);
         }
 
         fn maxLoad(bucket_count: usize) usize {
             return bucket_count * group_len * max_load_num / max_load_den;
         }
 
-        fn growTo(self: *Self, new_bucket_count: usize) !void {
+        fn growTo(self: *Self, allocator: std.mem.Allocator, new_bucket_count: usize) !void {
             var new_map = Self{
-                .allocator = self.allocator,
                 .ctx = self.ctx,
-                .keys = try self.allocator.alloc(K, new_bucket_count * group_len),
-                .values = try self.allocator.alloc(V, new_bucket_count * group_len),
-                .tags = try self.allocator.alloc(u8, new_bucket_count * group_len),
+                .keys = try allocator.alloc(K, new_bucket_count * group_len),
+                .values = try allocator.alloc(V, new_bucket_count * group_len),
+                .tags = try allocator.alloc(u8, new_bucket_count * group_len),
                 .bucket_count = new_bucket_count,
                 .len = 0,
             };
             errdefer {
-                self.allocator.free(new_map.keys);
-                self.allocator.free(new_map.values);
-                self.allocator.free(new_map.tags);
+                allocator.free(new_map.keys);
+                allocator.free(new_map.values);
+                allocator.free(new_map.tags);
             }
             @memset(new_map.tags, 0);
 
             if (self.bucket_count > 0) {
                 for (0..self.bucket_count * group_len) |i| {
                     if (self.tags[i] != 0) {
-                        new_map.putAssumeCapacity(self.keys[i], self.values[i]);
+                        new_map.tryPut(allocator, self.keys[i], self.values[i]);
                     }
                 }
-                self.allocator.free(self.keys);
-                self.allocator.free(self.values);
-                self.allocator.free(self.tags);
+                allocator.free(self.keys);
+                allocator.free(self.values);
+                allocator.free(self.tags);
             }
 
             self.* = new_map;
@@ -174,7 +170,7 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             return bucket * group_len + lane;
         }
 
-        fn putAssumeCapacity(self: *Self, key: K, value: V) void {
+        fn tryPut(self: *Self, allocator: std.mem.Allocator, key: K, value: V) void {
             const hash0 = self.hashKey(key);
             const hash1 = std.math.rotl(u64, hash0, 32);
             const tag = tagFromHash(hash0);
@@ -243,8 +239,8 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
                 }
             }
 
-            self.growTo(self.bucket_count * 2) catch unreachable;
-            self.putAssumeCapacity(cur_key, cur_val);
+            self.growTo(allocator, self.bucket_count * 2) catch unreachable;
+            self.tryPut(allocator, cur_key, cur_val);
         }
     };
 }

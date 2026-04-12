@@ -1,28 +1,22 @@
 // zig build --release=fast run
 const std = @import("std");
-const qf = @import("qf_swiss_map.zig");
-const qf_meta_tree_runend = @import("qf_swiss_qfmeta_tree_runend.zig");
+const qf_tree = @import("qf_tree_map.zig");
+const qf_block = @import("qf_block_map.zig");
 const boost = @import("boost_flat_map.zig");
 const cuckoo = @import("cuckoo_simd_map.zig");
+const fried = @import("fried_map.zig");
 
 const Io = std.Io;
-const StdMap = std.AutoHashMap(u64, u64);
-const ArrayHashMapImpl = std.AutoArrayHashMap(u64, u64);
-const QfMap = qf.QfHashMap(u64, u64);
-const QfMetaTreeRunEndMap = qf_meta_tree_runend.QfMetaTreeRunEndHashMap(u64, u64);
+const StdMap = std.AutoHashMapUnmanaged(u64, u64);
+const ArrayHashMapImpl = std.array_hash_map.Auto(u64, u64);
+const QfTreeMap = qf_tree.QfTreeHashMap(u64, u64);
+const QfBlockMap = qf_block.QfBlocksHashMap(u64, u64);
 const CuckooMap = cuckoo.CuckooSimdHashMap(u64, u64);
 const BoostMap = boost.BoostStyleFlatMap(u64, u64);
-const StdBench = BenchmarkFns(StdMap);
-const ArrayHashMapBench = BenchmarkFns(ArrayHashMapImpl);
-const QfBench = BenchmarkFns(QfMap);
-const QfMetaTreeRunEndBench = BenchmarkFns(QfMetaTreeRunEndMap);
-const CuckooBench = BenchmarkFns(CuckooMap);
-const BoostBench = BenchmarkFns(BoostMap);
+const FriedMap = fried.HashMapUnmanaged(u64, u64, std.hash_map.AutoContext(u64), 80);
 
 const BenchSpec = struct {
     short_label: []const u8,
-    size_label: []const u8,
-    Map: type,
     Bench: type,
 };
 
@@ -32,12 +26,13 @@ const BenchmarkRun = struct {
 };
 
 const bench_specs = [_]BenchSpec{
-    .{ .short_label = "std", .size_label = "std.AutoHashMap(u64,u64):", .Map = StdMap, .Bench = StdBench },
-    .{ .short_label = "arrayhashmap", .size_label = "std.ArrayHashMap(u64,u64):", .Map = ArrayHashMapImpl, .Bench = ArrayHashMapBench },
-    .{ .short_label = "qf", .size_label = "QfHashMap(u64,u64):", .Map = QfMap, .Bench = QfBench },
-    .{ .short_label = "qf_meta_tree_runend", .size_label = "QfMetaTreeRunEndHashMap(u64,u64):", .Map = QfMetaTreeRunEndMap, .Bench = QfMetaTreeRunEndBench },
-    .{ .short_label = "cuckoo", .size_label = "CuckooSimdHashMap(u64,u64):", .Map = CuckooMap, .Bench = CuckooBench },
-    .{ .short_label = "boost_flat", .size_label = "BoostStyleFlatMap(u64,u64):", .Map = BoostMap, .Bench = BoostBench },
+    .{ .short_label = "std", .Bench = BenchmarkFns(StdMap) },
+    .{ .short_label = "arrayhashmap", .Bench = BenchmarkFns(ArrayHashMapImpl) },
+    // .{ .short_label = "qf_tree", .Bench = BenchmarkFns(QfTreeMap) },
+    // .{ .short_label = "qf_block", .Bench = BenchmarkFns(QfBlockMap) },
+    .{ .short_label = "boost_flat", .Bench = BenchmarkFns(BoostMap) },
+    .{ .short_label = "cuckoo", .Bench = BenchmarkFns(CuckooMap) },
+    .{ .short_label = "fried", .Bench = BenchmarkFns(FriedMap) },
 };
 
 const config_benchmarks = [_]BenchmarkRun{
@@ -54,8 +49,8 @@ const load_benchmarks = [_]BenchmarkRun{
 };
 
 const Config = struct {
-    working_set: usize,
-    operations: usize,
+    working_set: u32,
+    operations: u32,
 };
 
 const Result = struct {
@@ -64,32 +59,18 @@ const Result = struct {
 };
 
 const LoadCase = struct {
-    capacity: usize,
-    load_num: usize,
-    load_den: usize,
+    capacity: u32,
+    load_num: u32,
+    load_den: u32,
     operations: usize,
 };
 
 fn BenchmarkFns(comptime MapType: type) type {
     return struct {
-        fn initMap(allocator: std.mem.Allocator, capacity: usize, comptime reserve_for_std: bool) !MapType {
-            if (MapType == StdMap) {
-                var map = MapType.init(allocator);
-                if (reserve_for_std) {
-                    try map.ensureTotalCapacity(@intCast(capacity));
-                }
-                return map;
-            }
-
-            if (MapType == ArrayHashMapImpl) {
-                var map = MapType.init(allocator);
-                if (reserve_for_std) {
-                    try map.ensureTotalCapacity(@intCast(capacity));
-                }
-                return map;
-            }
-
-            return try MapType.initCapacity(allocator, capacity);
+        fn initMap(allocator: std.mem.Allocator, capacity: u32) !MapType {
+            var map: MapType = .empty;
+            try map.ensureTotalCapacity(allocator, capacity);
+            return map;
         }
 
         fn removeKey(map: *MapType, key: u64) bool {
@@ -100,15 +81,15 @@ fn BenchmarkFns(comptime MapType: type) type {
         }
 
         fn deleteChurn(io: Io, allocator: std.mem.Allocator, cfg: Config) !Result {
-            var map = try initMap(allocator, cfg.working_set * 2, false);
-            defer map.deinit();
+            var map = try initMap(allocator, cfg.working_set * 2);
+            defer map.deinit(allocator);
 
             var live_keys = try allocator.alloc(u64, cfg.working_set);
             defer allocator.free(live_keys);
 
             for (0..cfg.working_set) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
                 live_keys[i] = key;
             }
 
@@ -120,7 +101,7 @@ fn BenchmarkFns(comptime MapType: type) type {
                 const slot = i % cfg.working_set;
                 const old_key = live_keys[slot];
 
-                if (MapType != StdMap and map.get(old_key) == null) {
+                if (map.get(old_key) == null) {
                     std.debug.print("missing key {d}\n", .{old_key});
                     std.debug.print("map type: {s}\n", .{@typeName(MapType)});
                     return error.BenchmarkInvariantFailed;
@@ -129,7 +110,7 @@ fn BenchmarkFns(comptime MapType: type) type {
 
                 const new_key = next_key;
                 next_key += 1;
-                try map.put(new_key, new_key);
+                try map.put(allocator, new_key, new_key);
                 live_keys[slot] = new_key;
 
                 const miss = map.get(next_key) == null;
@@ -146,12 +127,12 @@ fn BenchmarkFns(comptime MapType: type) type {
         }
 
         fn alternatingReuse(io: Io, allocator: std.mem.Allocator, cfg: Config) !Result {
-            var map = try initMap(allocator, cfg.working_set * 2, false);
-            defer map.deinit();
+            var map = try initMap(allocator, cfg.working_set * 2);
+            defer map.deinit(allocator);
 
             for (0..cfg.working_set) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
             }
 
             const start = Io.Timestamp.now(io, .awake);
@@ -161,7 +142,7 @@ fn BenchmarkFns(comptime MapType: type) type {
                 const key = @as(u64, @intCast(i % cfg.working_set));
 
                 if (!removeKey(&map, key)) return error.BenchmarkInvariantFailed;
-                try map.put(key, key +% @as(u64, @intCast(i)));
+                try map.put(allocator, key, key +% @as(u64, @intCast(i)));
 
                 checksum +%= map.get(key).?;
             }
@@ -176,8 +157,8 @@ fn BenchmarkFns(comptime MapType: type) type {
         }
 
         fn insertLight(io: Io, allocator: std.mem.Allocator, cfg: Config) !Result {
-            var map = try initMap(allocator, cfg.operations * 2, true);
-            defer map.deinit();
+            var map = try initMap(allocator, cfg.operations * 2);
+            defer map.deinit(allocator);
 
             var queue = try allocator.alloc(u64, cfg.operations);
             defer allocator.free(queue);
@@ -190,7 +171,7 @@ fn BenchmarkFns(comptime MapType: type) type {
 
             for (0..cfg.operations) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
                 queue[tail] = key;
                 tail += 1;
 
@@ -215,8 +196,8 @@ fn BenchmarkFns(comptime MapType: type) type {
         }
 
         fn insertNearFull(io: Io, allocator: std.mem.Allocator, cfg: Config) !Result {
-            var map = try initMap(allocator, cfg.working_set, true);
-            defer map.deinit();
+            var map = try initMap(allocator, cfg.working_set);
+            defer map.deinit(allocator);
 
             const prefill = cfg.working_set - cfg.working_set / 8;
             var queue = try allocator.alloc(u64, prefill + cfg.operations);
@@ -226,7 +207,7 @@ fn BenchmarkFns(comptime MapType: type) type {
 
             for (0..prefill) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
                 queue[tail] = key;
                 tail += 1;
             }
@@ -237,7 +218,7 @@ fn BenchmarkFns(comptime MapType: type) type {
 
             for (0..cfg.operations) |i| {
                 const key = @as(u64, @intCast(prefill + i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
                 queue[tail] = key;
                 tail += 1;
 
@@ -263,12 +244,12 @@ fn BenchmarkFns(comptime MapType: type) type {
 
         fn lookupHit(io: Io, allocator: std.mem.Allocator, case: LoadCase) !Result {
             const items = loadItemCount(case);
-            var map = try initMap(allocator, items, true);
-            defer map.deinit();
+            var map = try initMap(allocator, items);
+            defer map.deinit(allocator);
 
             for (0..items) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
             }
 
             const start = Io.Timestamp.now(io, .awake);
@@ -288,12 +269,12 @@ fn BenchmarkFns(comptime MapType: type) type {
 
         fn lookupMiss(io: Io, allocator: std.mem.Allocator, case: LoadCase) !Result {
             const items = loadItemCount(case);
-            var map = try initMap(allocator, items, true);
-            defer map.deinit();
+            var map = try initMap(allocator, items);
+            defer map.deinit(allocator);
 
             for (0..items) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
             }
 
             const start = Io.Timestamp.now(io, .awake);
@@ -314,14 +295,14 @@ fn BenchmarkFns(comptime MapType: type) type {
 
         fn insertLoad(io: Io, allocator: std.mem.Allocator, case: LoadCase) !Result {
             const items = loadItemCount(case);
-            var map = try initMap(allocator, items, true);
-            defer map.deinit();
+            var map = try initMap(allocator, items);
+            defer map.deinit(allocator);
 
             const start = Io.Timestamp.now(io, .awake);
             var checksum: u64 = 0;
             for (0..items) |i| {
                 const key = @as(u64, @intCast(i));
-                try map.put(key, key);
+                try map.put(allocator, key, key);
                 checksum +%= key;
             }
 
@@ -336,7 +317,7 @@ fn BenchmarkFns(comptime MapType: type) type {
     };
 }
 
-fn loadItemCount(case: LoadCase) usize {
+fn loadItemCount(case: LoadCase) u32 {
     return case.capacity * case.load_num / case.load_den;
 }
 
@@ -370,7 +351,7 @@ fn printBenchmarkLine(stdout: anytype, comptime show_ratio: bool, label: []const
     inline for (bench_specs, 0..) |spec, idx| {
         if (show_ratio and idx != 0) {
             try stdout.print(
-                " {s}={d:>8} ({d:.2}x)",
+                " {s}={d:>8} ({d:>6.2}x)",
                 .{ spec.short_label, results[idx].ns_per_op, ratioAgainstStd(results[0].ns_per_op, results[idx].ns_per_op) },
             );
         } else {
@@ -442,13 +423,14 @@ test "QfHashMap delete churn preserves entries" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var map = try QfMap.initCapacity(allocator, 256 * 2);
-    defer map.deinit();
+    var map = QfBlockMap.empty;
+    try map.ensureTotalCapacity(allocator, 256 * 2);
+    defer map.deinit(allocator);
 
     var live = try allocator.alloc(u64, 256);
     for (0..256) |i| {
         const key: u64 = @intCast(i);
-        try map.put(key, key);
+        try map.put(allocator, key, key);
         live[i] = key;
     }
 
@@ -462,7 +444,7 @@ test "QfHashMap delete churn preserves entries" {
 
         const key = next;
         next += 1;
-        try map.put(key, key);
+        try map.put(allocator, key, key);
         live[slot] = key;
 
         try std.testing.expectEqual(key, map.get(key).?);
