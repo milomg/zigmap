@@ -1,12 +1,7 @@
 const std = @import("std");
 
-pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
-    const Context = std.hash_map.AutoContext(K);
-    const hashFn = std.hash_map.getAutoHashFn(K, Context);
-    const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
-
+pub fn CuckooSimdHashMap(comptime K: type, comptime V: type, comptime Context: type) type {
     return struct {
-        ctx: Context,
         keys: []K,
         values: []V,
         tags: []u8,
@@ -20,7 +15,6 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
         const max_kicks = 64;
 
         pub const empty: Self = .{
-            .ctx = .{},
             .keys = &.{},
             .values = &.{},
             .tags = &.{},
@@ -38,7 +32,6 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             allocator.free(self.values);
             allocator.free(self.tags);
             self.* = .{
-                .ctx = self.ctx,
                 .keys = &.{},
                 .values = &.{},
                 .tags = &.{},
@@ -82,7 +75,6 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
 
         fn growTo(self: *Self, allocator: std.mem.Allocator, new_bucket_count: usize) !void {
             var new_map = Self{
-                .ctx = self.ctx,
                 .keys = try allocator.alloc(K, new_bucket_count * group_len),
                 .values = try allocator.alloc(V, new_bucket_count * group_len),
                 .tags = try allocator.alloc(u8, new_bucket_count * group_len),
@@ -110,14 +102,6 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             self.* = new_map;
         }
 
-        fn hashKey(self: *const Self, key: K) u64 {
-            return hashFn(self.ctx, key);
-        }
-
-        fn eql(self: *const Self, a: K, b: K) bool {
-            return eqlFn(self.ctx, a, b);
-        }
-
         fn tagFromHash(hash: u64) u8 {
             return @as(u8, @truncate(hash >> 56)) | 1;
         }
@@ -135,7 +119,8 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
         fn findIndex(self: *const Self, key: K) ?usize {
             if (self.bucket_count == 0) return null;
 
-            const hash0 = self.hashKey(key);
+            const ctx: Context = undefined;
+            const hash0 = ctx.hash(key);
             const hash1 = std.math.rotl(u64, hash0, 32);
             const tag = tagFromHash(hash0);
             const b0 = self.bucketIndex(hash0);
@@ -154,7 +139,8 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
             while (bits != 0) {
                 const lane = @ctz(bits);
                 const idx = bucket * group_len + lane;
-                if (self.eql(self.keys[idx], key)) return idx;
+                const ctx: Context = undefined;
+                if (ctx.eql(self.keys[idx], key)) return idx;
                 bits &= bits - 1;
             }
             return null;
@@ -171,7 +157,8 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
         }
 
         fn tryPut(self: *Self, allocator: std.mem.Allocator, key: K, value: V) void {
-            const hash0 = self.hashKey(key);
+            const ctx: Context = undefined;
+            const hash0 = ctx.hash(key);
             const hash1 = std.math.rotl(u64, hash0, 32);
             const tag = tagFromHash(hash0);
             const b0 = self.bucketIndex(hash0);
@@ -223,7 +210,7 @@ pub fn CuckooSimdHashMap(comptime K: type, comptime V: type) type {
                 cur_val = evict_val;
                 cur_tag = evict_tag;
 
-                const evict_hash0 = self.hashKey(cur_key);
+                const evict_hash0 = ctx.hash(cur_key);
                 const evict_hash1 = std.math.rotl(u64, evict_hash0, 32);
                 const evict_b0 = self.bucketIndex(evict_hash0);
                 const evict_b1 = self.bucketIndex(evict_hash1);

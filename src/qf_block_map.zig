@@ -1,12 +1,7 @@
 const std = @import("std");
 
-pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
-    const Context = std.hash_map.AutoContext(K);
-    const hashFn = std.hash_map.getAutoHashFn(K, Context);
-    const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
-
+pub fn QfBlocksHashMap(comptime K: type, comptime V: type, comptime Context: type) type {
     return struct {
-        ctx: Context,
         entries: []Entry,
         tags: []u8,
         starts: []u64,
@@ -28,13 +23,10 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
         const max_overflow_slots = 255;
         const rs_padding_slots = max_overflow_slots;
         const tag_scan_chunk = @max(std.simd.suggestVectorLength(u8) orelse 1, @sizeOf(usize));
-        const verify_after_mutation = false;
 
         const bits_per_block = 64;
-        const saturated_offset = std.math.maxInt(u8);
 
         pub const empty: Self = .{
-            .ctx = .{},
             .entries = &.{},
             .tags = &.{},
             .starts = &.{},
@@ -58,7 +50,6 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             allocator.free(self.ends);
             allocator.free(self.offsets);
             self.* = .{
-                .ctx = self.ctx,
                 .entries = &.{},
                 .tags = &.{},
                 .starts = &.{},
@@ -84,7 +75,6 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             while (true) {
                 try self.ensureCapacity(allocator, self.len + 1);
                 if (self.putAssumeCapacity(key, value)) {
-                    if (verify_after_mutation) self.verifyMetadata();
                     return;
                 }
 
@@ -96,7 +86,8 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
         pub fn remove(self: *Self, key: K) bool {
             if (self.len == 0) return false;
 
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             if (!self.testStart(home)) return false;
 
@@ -114,7 +105,7 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             }
 
             var stop = idx + 1;
-            while (stop < self.slots_len and self.isSlotOccupied(stop) and self.homeForIndex(stop) != stop) {
+            while (stop < self.slots_len and self.isSlotOccupied(stop) and self.keyHomeForIndex(stop) != stop) {
                 stop += 1;
             }
 
@@ -128,8 +119,8 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             const clear_idx = stop - 1;
             self.tags[clear_idx] = 0;
             self.setEnd(clear_idx, false);
+            self.decOffsets(home, clear_idx);
             self.len -= 1;
-            if (verify_after_mutation) self.verifyMetadata();
             return true;
         }
 
@@ -163,7 +154,6 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             const num_blocks = @max((rs_len + bits_per_block - 1) / bits_per_block, 1);
 
             var new_map = Self{
-                .ctx = self.ctx,
                 .entries = try allocator.alloc(Entry, new_slots_len),
                 .tags = try allocator.alloc(u8, new_slots_len),
                 .starts = try allocator.alloc(u64, num_blocks),
@@ -222,117 +212,99 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
         }
 
         fn keyHomeForIndex(self: *const Self, idx: usize) usize {
-            return self.bucketFromHash(hashFn(self.ctx, self.entries[idx].key));
+            const ctx: Context = undefined;
+            return self.bucketFromHash(ctx.hash(self.entries[idx].key));
         }
 
         fn findEmptyFrom(self: *const Self, start: usize) ?usize {
-            var idx = start;
-            while (idx < self.slots_len and self.isSlotOccupied(idx)) : (idx += 1) {}
-            if (idx == self.slots_len) return null;
-            return idx;
+            return std.mem.findScalarPos(u8, self.tags, start, 0);
         }
 
         fn findRunStart(self: *const Self, home: usize) ?usize {
             if (!self.testStart(home)) return null;
             if (home == 0) return 0;
 
-            var run_start = self.runEnd(home - 1) + 1;
-            if (run_start < home) run_start = home;
-            return run_start;
-        }
+            const block_index = home / bits_per_block;
+            const block_start = block_index * bits_per_block;
+            const shifted_start = block_start + self.offsets[block_index];
 
-        fn endBit(self: *const Self, index: usize) bool {
-            return self.rankEnd(index + 1) != self.rankEnd(index);
-        }
-
-        fn setEndIfChanged(self: *Self, index: usize, value: bool) void {
-            if (self.endBit(index) == value) return;
-            self.setEnd(index, value);
+            const run_start = self.runEnd(home - 1) + 1;
+            return @max(run_start, shifted_start, home);
         }
 
         fn shiftRunEndsRightByOne(self: *Self, start: usize, end_inclusive: usize) void {
             if (start > end_inclusive) return;
 
-            var i = end_inclusive + 1;
-            while (i > start) {
-                i -= 1;
-                self.setEndIfChanged(i + 1, self.endBit(i));
+            const first_word = start / bits_per_block;
+            const last_word = (end_inclusive + 1) / bits_per_block;
+
+            var w = last_word + 1;
+            while (w > first_word) {
+                w -= 1;
+
+                const lo: usize = if (w == first_word) (start % bits_per_block) + 1 else 0;
+                const hi_excl: usize = if (w == last_word)
+                    ((end_inclusive + 1) % bits_per_block) + 1
+                else
+                    bits_per_block;
+                if (lo >= hi_excl) continue;
+
+                const seg_mask = bitRangeMask(lo, hi_excl);
+                const old_word = self.ends[w];
+                var shifted = (old_word << 1) & seg_mask;
+
+                if (lo == 0 and w > 0) {
+                    shifted |= ((self.ends[w - 1] >> 63) & 1);
+                }
+
+                self.ends[w] = (old_word & ~seg_mask) | shifted;
             }
-            self.setEndIfChanged(start, false);
-            self.afterShiftEndRight(start, end_inclusive);
+
+            setBit(self.ends, start, false);
         }
 
         fn shiftRunEndsLeftByOne(self: *Self, start: usize, end_inclusive: usize) void {
             if (start > end_inclusive) return;
             std.debug.assert(start > 0);
 
-            var i = start;
-            while (i <= end_inclusive) : (i += 1) {
-                self.setEndIfChanged(i - 1, self.endBit(i));
+            const first_word = (start - 1) / bits_per_block;
+            const last_word = (end_inclusive - 1) / bits_per_block;
+
+            var w = first_word;
+            while (w <= last_word) : (w += 1) {
+                const lo: usize = if (w == first_word) (start - 1) % bits_per_block else 0;
+                const hi_excl: usize = if (w == last_word)
+                    ((end_inclusive - 1) % bits_per_block) + 1
+                else
+                    bits_per_block;
+                if (lo >= hi_excl) continue;
+
+                const seg_mask = bitRangeMask(lo, hi_excl);
+                const old_word = self.ends[w];
+                var shifted = (old_word >> 1) & seg_mask;
+
+                if (hi_excl == bits_per_block and w + 1 < self.ends.len) {
+                    shifted |= ((self.ends[w + 1] & 1) << 63) & seg_mask;
+                }
+
+                self.ends[w] = (old_word & ~seg_mask) | shifted;
             }
-            self.setEndIfChanged(end_inclusive, false);
-            self.afterShiftEndLeft(start, end_inclusive);
+
+            setBit(self.ends, end_inclusive, false);
         }
 
-        fn verifyMetadata(self: *const Self) void {
-            const allocator = std.heap.page_allocator;
+        fn bitRangeMask(lo: usize, hi_excl: usize) u64 {
+            if (lo >= hi_excl) return 0;
 
-            const expected_start_words = (self.cap + 63) / 64;
-            const expected_end_words = (self.slots_len + 63) / 64;
-
-            const starts = allocator.alloc(u64, expected_start_words) catch unreachable;
-            defer allocator.free(starts);
-            @memset(starts, 0);
-
-            const ends = allocator.alloc(u64, expected_end_words) catch unreachable;
-            defer allocator.free(ends);
-            @memset(ends, 0);
-
-            var prev_home: ?usize = null;
-            var prev_slot: ?usize = null;
-            var live_count: usize = 0;
-
-            for (0..self.slots_len) |i| {
-                if (!self.isSlotOccupied(i)) continue;
-                live_count += 1;
-
-                const key_home = self.keyHomeForIndex(i);
-                setBitWords(starts, key_home, true);
-
-                const meta_home = self.homeForIndex(i);
-                if (meta_home != key_home) {
-                    std.debug.print(
-                        "home divergence at slot {} meta_home={} key_home={}\\n",
-                        .{ i, meta_home, key_home },
-                    );
-                }
-
-                if (prev_home) |ph| {
-                    if (key_home != ph) setBitWords(ends, prev_slot.?, true);
-                }
-                prev_home = key_home;
-                prev_slot = i;
-            }
-
-            if (prev_slot) |slot| {
-                setBitWords(ends, slot, true);
-            }
-
-            if (live_count != self.len) {
-                std.debug.panic("live count mismatch len={} live={}", .{ self.len, live_count });
-            }
-
-            for (0..self.cap) |i| {
-                if (self.testStart(i) != testBitWords(starts, i)) {
-                    std.debug.panic("start mismatch at bucket {}", .{i});
-                }
-            }
-
-            for (0..self.slots_len) |i| {
-                if (self.endBit(i) != testBitWords(ends, i)) {
-                    std.debug.panic("runend mismatch at slot {}", .{i});
-                }
-            }
+            const low_mask: u64 = if (lo == 0)
+                0
+            else
+                (@as(u64, 1) << @intCast(lo)) - 1;
+            const high_mask: u64 = if (hi_excl >= bits_per_block)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(hi_excl)) - 1;
+            return high_mask & ~low_mask;
         }
 
         fn setBitWords(words: []u64, index: usize, value: bool) void {
@@ -353,6 +325,8 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
         }
 
         fn findKeyInRun(self: *const Self, key: K, tag: u8, run_start: usize, run_end: usize) ?usize {
+            const ctx: Context = undefined;
+
             const run_len = run_end - run_start + 1;
             var idx = run_start;
             const simd_len = run_len - (run_len % tag_scan_chunk);
@@ -366,14 +340,14 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
                     while (matches != 0) {
                         const off: usize = @intCast(@ctz(matches));
                         const candidate = idx + off;
-                        if (eqlFn(self.ctx, self.entries[candidate].key, key)) return candidate;
+                        if (ctx.eql(self.entries[candidate].key, key)) return candidate;
                         matches &= matches - 1;
                     }
                 }
             }
 
             while (idx <= run_end) : (idx += 1) {
-                if (self.tags[idx] == tag and eqlFn(self.ctx, self.entries[idx].key, key)) return idx;
+                if (self.tags[idx] == tag and ctx.eql(self.entries[idx].key, key)) return idx;
             }
             return null;
         }
@@ -381,27 +355,45 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
         fn findIndex(self: *const Self, key: K) ?usize {
             if (self.len == 0) return null;
 
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             if (!self.testStart(home)) return null;
 
             const tag = tagFromHash(hash);
+
+            const home_tag = self.tags[home];
+
+            // Common fast path: exact key is in canonical slot.
+            if (home_tag != 0 and home_tag == tag and ctx.eql(self.entries[home].key, key)) {
+                return home;
+            }
+
             const run_start = self.findRunStart(home) orelse return null;
             const run_end = self.runEnd(home);
             return self.findKeyInRun(key, tag, run_start, run_end);
         }
 
         fn putAssumeCapacity(self: *Self, key: K, value: V) bool {
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             const tag = tagFromHash(hash);
+            const home_tag = self.tags[home];
 
-            if (!self.isSlotOccupied(home)) {
+            if (home_tag == 0) {
                 self.entries[home] = .{ .key = key, .value = value };
                 self.tags[home] = tag;
                 self.setStart(home, true);
                 self.setEnd(home, true);
+                self.incOffsets(home, home);
                 self.len += 1;
+                return true;
+            }
+
+            // Common fast path: update value in canonical slot.
+            if (home_tag == tag and ctx.eql(self.entries[home].key, key)) {
+                self.entries[home].value = value;
                 return true;
             }
 
@@ -445,37 +437,33 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             self.entries[insert_pos] = .{ .key = key, .value = value };
             self.tags[insert_pos] = tag;
 
-            self.setStart(home, true);
+            if (!had_run) self.setStart(home, true);
             if (had_run) {
                 self.setEnd(run_end, false);
             }
             self.setEnd(insert_pos, true);
-            self.afterInsert(home, insert_pos);
+            self.incOffsets(home, empty_slot);
             self.len += 1;
             return true;
         }
 
-        fn testStart(self: *const Self, index: usize) bool {
+        inline fn testStart(self: *const Self, index: usize) bool {
             return testBit(self.starts, index);
         }
 
-        fn setStart(self: *Self, index: usize, value: bool) void {
-            if (testBit(self.starts, index) == value) return;
+        inline fn setStart(self: *Self, index: usize, comptime value: bool) void {
             setBit(self.starts, index, value);
-            self.refreshOffsetsFromBit(index, true);
         }
 
-        fn setEnd(self: *Self, index: usize, value: bool) void {
-            if (testBit(self.ends, index) == value) return;
+        inline fn setEnd(self: *Self, index: usize, comptime value: bool) void {
             setBit(self.ends, index, value);
-            self.refreshOffsetsFromBit(index, true);
         }
 
-        fn rankEnd(self: *const Self, bit_index_exclusive: usize) u32 {
+        inline fn rankEnd(self: *const Self, bit_index_exclusive: usize) u32 {
             return rankBits(self.ends, self.rs_len, bit_index_exclusive);
         }
 
-        fn selectStart(self: *const Self, rank_zero_based: u32) ?usize {
+        inline fn selectStart(self: *const Self, rank_zero_based: u32) ?usize {
             return selectBits(self.starts, self.rs_len, rank_zero_based);
         }
 
@@ -484,7 +472,7 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
 
             const bucket_block_index = bucket_index / bits_per_block;
             const bucket_intrablock_offset = bucket_index % bits_per_block;
-            const bucket_blocks_offset = self.blockOffset(bucket_block_index);
+            const bucket_blocks_offset = self.offsets[bucket_block_index];
 
             const start_mask = if (bucket_intrablock_offset + 1 == bits_per_block)
                 std.math.maxInt(u64)
@@ -526,63 +514,33 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             return if (runend_index < bucket_index) bucket_index else runend_index;
         }
 
-        fn afterShiftEndRight(self: *Self, start: usize, end_inclusive: usize) void {
-            _ = end_inclusive;
-            self.refreshOffsetsFromBit(start, false);
+        fn adjustBlockOffset(self: *Self, block_index: usize, inc: bool) void {
+            const block = block_index % self.offsets.len;
+            const current = self.offsets[block];
+            const new_value: u8 = if (inc)
+                current +| 1
+            else
+                current -| 1;
+            self.offsets[block] = new_value;
         }
 
-        fn afterShiftEndLeft(self: *Self, start: usize, end_inclusive: usize) void {
-            _ = end_inclusive;
-            const earliest = if (start == 0) self.rs_len - 1 else start - 1;
-            self.refreshOffsetsFromBit(earliest, false);
+        fn incOffsets(self: *Self, start_bucket: usize, end_bucket: usize) void {
+            const original_block = start_bucket / bits_per_block;
+            const last_affected_block = end_bucket / bits_per_block;
+            if (last_affected_block <= original_block) return;
+
+            for (original_block + 1..last_affected_block + 1) |b| {
+                self.adjustBlockOffset(b, true);
+            }
         }
 
-        fn afterInsert(self: *Self, home: usize, insert_pos: usize) void {
-            const earliest = @min(home, insert_pos);
-            self.refreshOffsetsFromBit(earliest, false);
-        }
+        fn decOffsets(self: *Self, start_bucket: usize, end_bucket: usize) void {
+            const original_block = start_bucket / bits_per_block;
+            const last_affected_block = end_bucket / bits_per_block;
+            if (last_affected_block <= original_block) return;
 
-        fn blockOffset(self: *const Self, block_index: usize) usize {
-            const raw = self.offsets[block_index];
-            if (raw < saturated_offset) return raw;
-            if (block_index == 0) return 0;
-
-            const block_start = block_index * bits_per_block;
-            const prev_run_end = self.runEnd(block_start - 1);
-            if (prev_run_end + 1 <= block_start) return 0;
-            return prev_run_end - block_start + 1;
-        }
-
-        fn refreshOffsetsFromBit(self: *Self, bit_index: usize, allow_early_stop: bool) void {
-            if (self.offsets.len <= 1) return;
-            var block = bit_index / bits_per_block + 1;
-            if (block >= self.offsets.len) block = 1;
-            self.refreshOffsetsFromBlock(block, allow_early_stop);
-        }
-
-        fn refreshOffsetsFromBlock(self: *Self, block_index: usize, allow_early_stop: bool) void {
-            if (self.offsets.len == 0) return;
-            if (block_index >= self.offsets.len) return;
-            var block = @max(block_index, @as(usize, 1));
-            while (block < self.offsets.len) : (block += 1) {
-                const old_offset = self.offsets[block];
-                const block_start = block * bits_per_block;
-                const prev_slot = block_start - 1;
-                const prev_run_end = self.runEnd(prev_slot);
-                if (prev_run_end + 1 <= block_start) {
-                    self.offsets[block] = 0;
-                    if (allow_early_stop and old_offset == 0) break;
-                    continue;
-                }
-
-                const raw = prev_run_end - block_start + 1;
-                const new_offset: u8 = if (raw >= saturated_offset)
-                    saturated_offset
-                else
-                    @intCast(raw);
-                self.offsets[block] = new_offset;
-
-                if (allow_early_stop and new_offset == old_offset and new_offset < saturated_offset) break;
+            for (original_block + 1..last_affected_block + 1) |b| {
+                self.adjustBlockOffset(b, false);
             }
         }
 
@@ -593,7 +551,7 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
             return (bits[block_index] & mask) != 0;
         }
 
-        fn setBit(bits: []u64, index: usize, value: bool) void {
+        fn setBit(bits: []u64, index: usize, comptime value: bool) void {
             const block_index = index / bits_per_block;
             const bit_index = index % bits_per_block;
             const mask = @as(u64, 1) << @intCast(bit_index);
@@ -644,8 +602,15 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type) type {
                 word
             else
                 word & ~((@as(u64, 1) << @intCast(ignore_bits)) - 1);
-            const bit = selectBitInU64Broadword(masked, @intCast(rank_zero_based)) orelse return bits_per_block;
-            return bit;
+            if (masked == 0) return bits_per_block;
+
+            var bits = masked;
+            var remaining = rank_zero_based;
+            while (remaining > 0) : (remaining -= 1) {
+                bits &= bits - 1;
+                if (bits == 0) return bits_per_block;
+            }
+            return @intCast(@ctz(bits));
         }
 
         fn selectBitInU64Broadword(word: u64, rank_zero_based: u32) ?usize {

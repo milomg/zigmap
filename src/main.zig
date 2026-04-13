@@ -7,13 +7,17 @@ const cuckoo = @import("cuckoo_simd_map.zig");
 const fried = @import("fried_map.zig");
 
 const Io = std.Io;
-const StdMap = std.AutoHashMapUnmanaged(u64, u64);
-const ArrayHashMapImpl = std.array_hash_map.Auto(u64, u64);
-const QfTreeMap = qf_tree.QfTreeHashMap(u64, u64);
-const QfBlockMap = qf_block.QfBlocksHashMap(u64, u64);
-const CuckooMap = cuckoo.CuckooSimdHashMap(u64, u64);
-const BoostMap = boost.BoostStyleFlatMap(u64, u64);
-const FriedMap = fried.HashMapUnmanaged(u64, u64, std.hash_map.AutoContext(u64), 80);
+const K = u64;
+const V = u64;
+const HashContext = std.hash_map.AutoContext(K);
+const ArrayHashContext = std.array_hash_map.AutoContext(K);
+const StdMap = std.HashMapUnmanaged(K, V, HashContext, 80);
+const ArrayHashMapImpl = std.array_hash_map.ArrayHashMap(K, V, ArrayHashContext, false);
+const QfTreeMap = qf_tree.QfTreeHashMap(K, V, HashContext);
+const QfBlockMap = qf_block.QfBlocksHashMap(K, V, HashContext);
+const CuckooMap = cuckoo.CuckooSimdHashMap(K, V, HashContext);
+const BoostMap = boost.BoostStyleFlatMap(K, V, HashContext);
+const FriedMap = fried.HashMapUnmanaged(K, V, HashContext, 80);
 
 const BenchSpec = struct {
     short_label: []const u8,

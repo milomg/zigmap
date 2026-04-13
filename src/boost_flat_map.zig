@@ -1,12 +1,7 @@
 const std = @import("std");
 
-pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
-    const Context = std.hash_map.AutoContext(K);
-    const hashFn = std.hash_map.getAutoHashFn(K, Context);
-    const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
-
+pub fn BoostStyleFlatMap(comptime K: type, comptime V: type, comptime Context: type) type {
     return struct {
-        ctx: Context,
         metadata: ?[*]u8,
         cap: usize,
         group_count: usize,
@@ -23,7 +18,6 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
         const empty_meta: u8 = 0;
 
         pub const empty: Self = .{
-            .ctx = .{},
             .metadata = null,
             .cap = 0,
             .group_count = 0,
@@ -38,7 +32,6 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.deallocateStorage(allocator);
             self.* = .{
-                .ctx = self.ctx,
                 .metadata = null,
                 .cap = 0,
                 .group_count = 0,
@@ -63,7 +56,8 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
 
         pub fn remove(self: *Self, key: K) bool {
             const idx = self.findIndex(key) orelse return false;
-            const hash = self.hashKey(key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const overflow_bit = overflowBitFromHash(hash);
             const grp = idx / group_size;
             const grp_overflow = self.metaPtr()[metaOffsetForGroup(grp) + group_size];
@@ -159,7 +153,6 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
 
         fn growToGroups(self: *Self, allocator: std.mem.Allocator, new_group_count: usize) !void {
             var new_map = Self{
-                .ctx = self.ctx,
                 .metadata = null,
                 .cap = 0,
                 .group_count = 0,
@@ -183,14 +176,6 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
 
         inline fn isOccupied(self: *const Self, bucket: usize) bool {
             return self.metaForBucket(bucket) >= 2;
-        }
-
-        inline fn hashKey(self: *const Self, key: K) u64 {
-            return hashFn(self.ctx, key);
-        }
-
-        inline fn eql(self: *const Self, a: K, b: K) bool {
-            return eqlFn(self.ctx, a, b);
         }
 
         inline fn groupFromHash(self: *const Self, hash: u64) usize {
@@ -236,7 +221,8 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
         fn findIndex(self: *const Self, key: K) ?usize {
             if (self.len == 0) return null;
 
-            const hash = self.hashKey(key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const fp = fingerprintFromHash(hash);
             const overflow_bit = overflowBitFromHash(hash);
             const fp_lane: @Vector(group_span, u8) = @splat(fp);
@@ -253,7 +239,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
                     inline for (0..group_size) |lane| {
                         if (chunk_bytes[lane] == fp) {
                             const bucket = bucketForGroupLane(group, lane);
-                            if (self.eql(self.keys()[bucket], key)) return bucket;
+                            if (ctx.eql(self.keys()[bucket], key)) return bucket;
                         }
                     }
                 }
@@ -267,7 +253,8 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
         }
 
         fn putAssumeCapacity(self: *Self, key: K, value: V) void {
-            const hash = self.hashKey(key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const fp = fingerprintFromHash(hash);
             const overflow_bit = overflowBitFromHash(hash);
             const fp_lane: @Vector(group_span, u8) = @splat(fp);
@@ -286,7 +273,7 @@ pub fn BoostStyleFlatMap(comptime K: type, comptime V: type) type {
                     inline for (0..group_size) |lane_match| {
                         if (chunk_bytes[lane_match] == fp) {
                             const bucket_match = bucketForGroupLane(group, lane_match);
-                            if (self.eql(self.keys()[bucket_match], key)) {
+                            if (ctx.eql(self.keys()[bucket_match], key)) {
                                 self.values()[bucket_match] = value;
                                 return;
                             }

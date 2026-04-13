@@ -1,13 +1,8 @@
 const std = @import("std");
 const rank_tree2 = @import("rank_select/rank_select_tree2.zig");
 
-pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
-    const Context = std.hash_map.AutoContext(K);
-    const hashFn = std.hash_map.getAutoHashFn(K, Context);
-    const eqlFn = std.hash_map.getAutoEqlFn(K, Context);
-
+pub fn QfTreeHashMap(comptime K: type, comptime V: type, comptime Context: type) type {
     return struct {
-        ctx: Context,
         entries: []Entry,
         tags: []u8,
         occupied: rank_tree2.RankSelectTree,
@@ -28,7 +23,6 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         const tag_scan_chunk = @max(std.simd.suggestVectorLength(u8) orelse 1, @sizeOf(usize));
 
         pub const empty: Self = .{
-            .ctx = .{},
             .entries = &.{},
             .tags = &.{},
             .occupied = undefined,
@@ -49,7 +43,6 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
             self.occupied.deinit();
             self.run_end.deinit();
             self.* = .{
-                .ctx = self.ctx,
                 .entries = &.{},
                 .tags = &.{},
                 .occupied = undefined,
@@ -82,7 +75,8 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         pub fn remove(self: *Self, key: K) bool {
             if (self.len == 0) return false;
 
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             if (!self.occupied.testBit(home)) return false;
 
@@ -150,7 +144,6 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         fn growTo(self: *Self, allocator: std.mem.Allocator, new_cap: usize) !void {
             const new_slots_len = new_cap + overflowSlots(new_cap);
             var new_map = Self{
-                .ctx = self.ctx,
                 .entries = try allocator.alloc(Entry, new_slots_len),
                 .tags = try allocator.alloc(u8, new_slots_len),
                 .occupied = try rank_tree2.RankSelectTree.init(allocator, new_slots_len),
@@ -270,6 +263,7 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         }
 
         fn findKeyInRun(self: *const Self, key: K, tag: u8, run_start: usize, run_end: usize) ?usize {
+            const ctx: Context = undefined;
             const run_len = run_end - run_start + 1;
             var idx = run_start;
 
@@ -284,14 +278,14 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
                     while (matches != 0) {
                         const off: usize = @intCast(@ctz(matches));
                         const candidate = idx + off;
-                        if (eqlFn(self.ctx, self.entries[candidate].key, key)) return candidate;
+                        if (ctx.eql(self.entries[candidate].key, key)) return candidate;
                         matches &= matches - 1;
                     }
                 }
             }
 
             while (idx <= run_end) : (idx += 1) {
-                if (self.tags[idx] == tag and eqlFn(self.ctx, self.entries[idx].key, key)) return idx;
+                if (self.tags[idx] == tag and ctx.eql(self.entries[idx].key, key)) return idx;
             }
 
             return null;
@@ -300,7 +294,8 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         fn findIndex(self: *const Self, key: K) ?usize {
             if (self.len == 0) return null;
 
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             if (!self.occupied.testBit(home)) return null;
 
@@ -312,7 +307,8 @@ pub fn QfTreeHashMap(comptime K: type, comptime V: type) type {
         }
 
         fn putAssumeCapacity(self: *Self, key: K, value: V) bool {
-            const hash = hashFn(self.ctx, key);
+            const ctx: Context = undefined;
+            const hash = ctx.hash(key);
             const home = self.bucketFromHash(hash);
             const tag = tagFromHash(hash);
 
