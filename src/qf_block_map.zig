@@ -105,7 +105,7 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type, comptime Context: typ
             }
 
             var stop = idx + 1;
-            while (stop < self.slots_len and self.isSlotOccupied(stop) and self.keyHomeForIndex(stop) != stop) {
+            while (stop < self.slots_len and self.isSlotOccupied(stop) and self.homeForIndex(stop) != stop) {
                 stop += 1;
             }
 
@@ -209,11 +209,6 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type, comptime Context: typ
         fn homeForIndex(self: *const Self, idx: usize) usize {
             const run_rank = self.rankEnd(idx);
             return self.selectStart(run_rank) orelse unreachable;
-        }
-
-        fn keyHomeForIndex(self: *const Self, idx: usize) usize {
-            const ctx: Context = undefined;
-            return self.bucketFromHash(ctx.hash(self.entries[idx].key));
         }
 
         fn findEmptyFrom(self: *const Self, start: usize) ?usize {
@@ -437,8 +432,9 @@ pub fn QfBlocksHashMap(comptime K: type, comptime V: type, comptime Context: typ
             self.entries[insert_pos] = .{ .key = key, .value = value };
             self.tags[insert_pos] = tag;
 
-            if (!had_run) self.setStart(home, true);
-            if (had_run) {
+            if (!had_run) {
+                self.setStart(home, true);
+            } else {
                 self.setEnd(run_end, false);
             }
             self.setEnd(insert_pos, true);
