@@ -2,6 +2,8 @@
 const std = @import("std");
 const qf_tree = @import("qf_tree_map.zig");
 const qf_block = @import("qf_block_map.zig");
+const qf_block_bucket = @import("qf_block_bucket_map.zig");
+const qf_rsqf_bucket = @import("qf_rsqf_bucket_map.zig");
 const boost = @import("boost_flat_map.zig");
 const cuckoo = @import("cuckoo_simd_map.zig");
 const fried = @import("fried_map.zig");
@@ -15,6 +17,8 @@ const StdMap = std.HashMapUnmanaged(K, V, HashContext, 80);
 const ArrayHashMapImpl = std.array_hash_map.ArrayHashMap(K, V, ArrayHashContext, false);
 const QfTreeMap = qf_tree.QfTreeHashMap(K, V, HashContext);
 const QfBlockMap = qf_block.QfBlocksHashMap(K, V, HashContext);
+const QfBlockBucketMap = qf_block_bucket.QfBlocksBucketHashMap(K, V, HashContext);
+const QfRsqfBucketMap = qf_rsqf_bucket.QfRsqfBucketMap(K, V, HashContext);
 const CuckooMap = cuckoo.CuckooSimdHashMap(K, V, HashContext);
 const BoostMap = boost.BoostStyleFlatMap(K, V, HashContext);
 const FriedMap = fried.HashMapUnmanaged(K, V, HashContext, 80);
@@ -32,11 +36,13 @@ const BenchmarkRun = struct {
 const bench_specs = [_]BenchSpec{
     .{ .short_label = "std", .Bench = BenchmarkFns(StdMap) },
     .{ .short_label = "arrayhashmap", .Bench = BenchmarkFns(ArrayHashMapImpl) },
-    // .{ .short_label = "qf_tree", .Bench = BenchmarkFns(QfTreeMap) },
-    // .{ .short_label = "qf_block", .Bench = BenchmarkFns(QfBlockMap) },
+    .{ .short_label = "qf_tree", .Bench = BenchmarkFns(QfTreeMap) },
+    .{ .short_label = "qf_block", .Bench = BenchmarkFns(QfBlockMap) },
+    .{ .short_label = "qf_block_bucket", .Bench = BenchmarkFns(QfBlockBucketMap) },
+    .{ .short_label = "qf_rsqf", .Bench = BenchmarkFns(QfRsqfBucketMap) },
     .{ .short_label = "boost_flat", .Bench = BenchmarkFns(BoostMap) },
     .{ .short_label = "cuckoo", .Bench = BenchmarkFns(CuckooMap) },
-    .{ .short_label = "fried", .Bench = BenchmarkFns(FriedMap) },
+    // .{ .short_label = "fried", .Bench = BenchmarkFns(FriedMap) },
 };
 
 const config_benchmarks = [_]BenchmarkRun{
@@ -365,6 +371,54 @@ fn printBenchmarkLine(stdout: anytype, comptime show_ratio: bool, label: []const
     try stdout.print("\n", .{});
 }
 
+fn writeCsvHeader(writer: *Io.Writer) !void {
+    try writer.print(
+        "suite,case_id,benchmark,map,ns_per_op,ratio_vs_std,working_set,operations,capacity,load_num,load_den,items,checksum\n",
+        .{},
+    );
+}
+
+fn writeConfigCsvRows(writer: *Io.Writer, case_id: usize, cfg: Config, benchmark_label: []const u8, results: [bench_specs.len]Result) !void {
+    inline for (bench_specs, 0..) |spec, idx| {
+        const ratio: f64 = if (idx == 0) 1.0 else ratioAgainstStd(results[0].ns_per_op, results[idx].ns_per_op);
+        try writer.print(
+            "config,{d},{s},{s},{d},{d:.6},{d},{d},,,,,{d}\n",
+            .{
+                case_id,
+                benchmark_label,
+                spec.short_label,
+                results[idx].ns_per_op,
+                ratio,
+                cfg.working_set,
+                cfg.operations,
+                results[idx].checksum,
+            },
+        );
+    }
+}
+
+fn writeLoadCsvRows(writer: anytype, case_id: usize, case: LoadCase, benchmark_label: []const u8, results: [bench_specs.len]Result) !void {
+    const items = loadItemCount(case);
+    inline for (bench_specs, 0..) |spec, idx| {
+        const ratio: f64 = if (idx == 0) 1.0 else ratioAgainstStd(results[0].ns_per_op, results[idx].ns_per_op);
+        try writer.print(
+            "load,{d},{s},{s},{d},{d:.6},,,{d},{d},{d},{d},{d}\n",
+            .{
+                case_id,
+                benchmark_label,
+                spec.short_label,
+                results[idx].ns_per_op,
+                ratio,
+                case.capacity,
+                case.load_num,
+                case.load_den,
+                items,
+                results[idx].checksum,
+            },
+        );
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
@@ -375,6 +429,15 @@ pub fn main(init: std.process.Init) !void {
     var arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
+
+    var cwd = std.Io.Dir.cwd();
+
+    var csv_file = try cwd.createFile(init.io, "benchmark_results.csv", .{ .truncate = true });
+    defer csv_file.close(init.io);
+
+    var csv_buffer: [0x400]u8 = undefined;
+    var csv_writer = csv_file.writer(init.io, &csv_buffer);
+    try writeCsvHeader(&csv_writer.interface);
 
     const configs = [_]Config{
         .{ .working_set = 256, .operations = 5_000 },
@@ -392,15 +455,17 @@ pub fn main(init: std.process.Init) !void {
         inline for (config_benchmarks) |benchmark| {
             const results = try runConfigBenchmark(benchmark.fn_name, io, arena, cfg);
             try printBenchmarkLine(stdout, true, benchmark.label, results);
+            try writeConfigCsvRows(&csv_writer.interface, i + 1, cfg, benchmark.label, results);
             try stdout.flush();
         }
     }
 
     const load_cases = [_]LoadCase{
         .{ .capacity = 1 << 16, .load_num = 4, .load_den = 8, .operations = 2_000_000 },
-        .{ .capacity = 1 << 16, .load_num = 5, .load_den = 8, .operations = 2_000_000 },
         .{ .capacity = 1 << 16, .load_num = 6, .load_den = 8, .operations = 2_000_000 },
         .{ .capacity = 1 << 16, .load_num = 7, .load_den = 8, .operations = 2_000_000 },
+        .{ .capacity = 1 << 16, .load_num = 13, .load_den = 16, .operations = 2_000_000 },
+        .{ .capacity = 1 << 16, .load_num = 14, .load_den = 16, .operations = 2_000_000 },
     };
 
     try stdout.print("\n=== Load Benchmarks ===\n", .{});
@@ -417,9 +482,14 @@ pub fn main(init: std.process.Init) !void {
         inline for (load_benchmarks) |benchmark| {
             const results = try runLoadBenchmark(benchmark.fn_name, io, arena, case);
             try printBenchmarkLine(stdout, false, benchmark.label, results);
+            try writeLoadCsvRows(&csv_writer.interface, case.load_num, case, benchmark.label, results);
             try stdout.flush();
         }
     }
+
+    try csv_writer.flush();
+    try stdout.print("\nWrote benchmark_results.csv ({d} rows)\n", .{1 + config_benchmarks.len * configs.len * bench_specs.len + load_benchmarks.len * load_cases.len * bench_specs.len});
+    try stdout.flush();
 }
 
 test "QfHashMap delete churn preserves entries" {
@@ -455,4 +525,80 @@ test "QfHashMap delete churn preserves entries" {
     }
 
     try std.testing.expectEqual(@as(usize, 256), map.count());
+}
+
+test "QfRsqfBucketMap randomized parity with std" {
+    var map = QfRsqfBucketMap.empty;
+    try map.ensureTotalCapacity(std.testing.allocator, 4096);
+    defer map.deinit(std.testing.allocator);
+
+    var reference = std.AutoHashMap(u64, u64).init(std.testing.allocator);
+    defer reference.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xfeedfacecafebabe);
+    const random = prng.random();
+
+    const key_space: u64 = 8192;
+    for (0..50_000) |_| {
+        const op = random.uintLessThan(u8, 100);
+        const key = random.uintLessThan(u64, key_space);
+
+        if (op < 45) {
+            const value = random.int(u64);
+            try map.put(std.testing.allocator, key, value);
+            try reference.put(key, value);
+        } else if (op < 70) {
+            const got = map.remove(key);
+            const expected = reference.remove(key);
+            try std.testing.expectEqual(expected, got);
+        } else {
+            const got = map.get(key);
+            const expected = reference.get(key);
+            try std.testing.expectEqual(expected, got);
+        }
+    }
+
+    try std.testing.expectEqual(reference.count(), map.count());
+    for (0..key_space) |k| {
+        const key: u64 = @intCast(k);
+        try std.testing.expectEqual(reference.get(key), map.get(key));
+    }
+}
+
+test "QfBlockBucketMap randomized parity with std" {
+    var map = QfBlockBucketMap.empty;
+    try map.ensureTotalCapacity(std.testing.allocator, 4096);
+    defer map.deinit(std.testing.allocator);
+
+    var reference = std.AutoHashMap(u64, u64).init(std.testing.allocator);
+    defer reference.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xdecafbad12345678);
+    const random = prng.random();
+
+    const key_space: u64 = 8192;
+    for (0..50_000) |_| {
+        const op = random.uintLessThan(u8, 100);
+        const key = random.uintLessThan(u64, key_space);
+
+        if (op < 45) {
+            const value = random.int(u64);
+            try map.put(std.testing.allocator, key, value);
+            try reference.put(key, value);
+        } else if (op < 70) {
+            const got = map.remove(key);
+            const expected = reference.remove(key);
+            try std.testing.expectEqual(expected, got);
+        } else {
+            const got = map.get(key);
+            const expected = reference.get(key);
+            try std.testing.expectEqual(expected, got);
+        }
+    }
+
+    try std.testing.expectEqual(reference.count(), map.count());
+    for (0..key_space) |k| {
+        const key: u64 = @intCast(k);
+        try std.testing.expectEqual(reference.get(key), map.get(key));
+    }
 }
