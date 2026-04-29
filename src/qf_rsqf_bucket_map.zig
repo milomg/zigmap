@@ -13,6 +13,48 @@
 // the number of keys hashing to b plus modest spillage, so lookups (especially
 // misses) stay fast even as the load factor approaches the structural ceiling.
 const std = @import("std");
+const builtin = @import("builtin");
+
+// BMI2 PDEP+TZCNT gives O(1) bit-select. On Zen 3+ and Haswell+ this is ~3 cycles
+// and dramatically beats the broadword fallback for our rank/select hot path.
+// Zen 1/2 microcodes PDEP (slow) so we only enable on machines where it's actually
+// fast — which here means anything that advertises BMI2 *and* is not pre-Zen3 AMD.
+// (Zig doesn't expose Zen-version granularity easily, but the common deployment
+//  targets that advertise BMI2 in 2025 all have fast PDEP, so gate on bmi2 alone.)
+const has_fast_pdep = blk: {
+    if (builtin.cpu.arch != .x86_64) break :blk false;
+    break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
+};
+
+inline fn pdep64(src: u64, mask: u64) u64 {
+    return asm ("pdepq %[mask], %[src], %[ret]"
+        : [ret] "=r" (-> u64),
+        : [src] "r" (src),
+          [mask] "r" (mask),
+    );
+}
+
+// Returns the bit position of the (k+1)-th set bit in `word` (0-indexed), or 64
+// if `word` has fewer than k+1 set bits.
+//
+// Fast path: PDEP isolates the target bit, TZCNT reads its position. ~3 cycles.
+// Fallback: clear-lowest-bit loop. Optimal for small k, which is what we get
+// here (rank within a block is bounded by the number of home positions per block).
+inline fn selectU64(word: u64, k: u32) usize {
+    if (comptime has_fast_pdep) {
+        const isolated = pdep64(@as(u64, 1) << @intCast(k), word);
+        if (isolated == 0) return 64;
+        return @intCast(@ctz(isolated));
+    }
+    if (word == 0) return 64;
+    var w = word;
+    var i: u32 = 0;
+    while (i < k) : (i += 1) {
+        w &= w - 1;
+        if (w == 0) return 64;
+    }
+    return @intCast(@ctz(w));
+}
 
 pub fn QfRsqfBucketMap(comptime K: type, comptime V: type, comptime Context: type) type {
     return struct {
@@ -306,11 +348,8 @@ pub fn QfRsqfBucketMap(comptime K: type, comptime V: type, comptime Context: typ
                     // Run end is past this word. Capture prev if it falls here.
                     if (want_prev_opt) |p| {
                         if (seen + cnt > p and seen <= p) {
-                            const k = p - seen;
-                            var w = word;
-                            var i: usize = 0;
-                            while (i < k) : (i += 1) w &= w - 1;
-                            prev_pos = b_idx * slots_per_block + @as(usize, @intCast(@ctz(w)));
+                            const k: u32 = @intCast(p - seen);
+                            prev_pos = b_idx * slots_per_block + selectU64(word, k);
                         }
                     }
                     seen += cnt;
@@ -320,19 +359,13 @@ pub fn QfRsqfBucketMap(comptime K: type, comptime V: type, comptime Context: typ
                 // Run end is in this word.
                 if (want_prev_opt) |p| {
                     if (prev_pos == null and p >= seen) {
-                        const k = p - seen;
-                        var w = word;
-                        var i: usize = 0;
-                        while (i < k) : (i += 1) w &= w - 1;
-                        prev_pos = b_idx * slots_per_block + @as(usize, @intCast(@ctz(w)));
+                        const k: u32 = @intCast(p - seen);
+                        prev_pos = b_idx * slots_per_block + selectU64(word, k);
                     }
                 }
 
-                const k_end = want_end - seen;
-                var we = word;
-                var ie: usize = 0;
-                while (ie < k_end) : (ie += 1) we &= we - 1;
-                const end_bit: usize = @intCast(@ctz(we));
+                const k_end: u32 = @intCast(want_end - seen);
+                const end_bit = selectU64(word, k_end);
                 var run_end_abs = b_idx * slots_per_block + end_bit;
                 if (run_end_abs < home) run_end_abs = home;
 
@@ -448,7 +481,8 @@ pub fn QfRsqfBucketMap(comptime K: type, comptime V: type, comptime Context: typ
                     remaining -= cnt;
                     continue;
                 }
-                const bit = selectBitInU64Broadword(word, remaining) orelse return null;
+                const bit = selectU64(word, remaining);
+                if (bit == 64) return null;
                 const absolute = block_idx * slots_per_block + bit;
                 if (absolute >= self.rs_len) return null;
                 return absolute;
@@ -577,42 +611,8 @@ pub fn QfRsqfBucketMap(comptime K: type, comptime V: type, comptime Context: typ
 
         fn selectFromOffset(word: u64, ignore_bits: usize, rank_zero_based: usize) usize {
             const masked = if (ignore_bits == 0) word else word & ~((@as(u64, 1) << @intCast(ignore_bits)) - 1);
-            if (masked == 0) return slots_per_block;
-            var bits = masked;
-            var remaining = rank_zero_based;
-            while (remaining > 0) : (remaining -= 1) {
-                bits &= bits - 1;
-                if (bits == 0) return slots_per_block;
-            }
-            return @intCast(@ctz(bits));
+            return selectU64(masked, @intCast(rank_zero_based));
         }
 
-        fn selectBitInU64Broadword(word: u64, rank_zero_based: u32) ?usize {
-            if (word == 0) return null;
-            const wanted: u16 = @intCast(rank_zero_based + 1);
-            var x = word;
-            x = x - ((x >> 1) & 0x5555_5555_5555_5555);
-            x = (x & 0x3333_3333_3333_3333) + ((x >> 2) & 0x3333_3333_3333_3333);
-            const per_byte = (x + (x >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
-            const cumulative = per_byte *% 0x0101_0101_0101_0101;
-            var byte_index: usize = 0;
-            var previous: u16 = 0;
-            while (byte_index < 8) : (byte_index += 1) {
-                const cum_byte: u16 = @intCast((cumulative >> @intCast(byte_index * 8)) & 0xff);
-                if (cum_byte >= wanted) break;
-                previous = cum_byte;
-            }
-            if (byte_index == 8) return null;
-            const rank_in_byte: usize = @intCast(wanted - previous - 1);
-            var byte_bits: u8 = @truncate(word >> @intCast(byte_index * 8));
-            var remaining = rank_in_byte;
-            while (byte_bits != 0) {
-                const bit: usize = @intCast(@ctz(byte_bits));
-                if (remaining == 0) return byte_index * 8 + bit;
-                byte_bits &= byte_bits - 1;
-                remaining -= 1;
-            }
-            return null;
-        }
     };
 }
